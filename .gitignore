@@ -1,0 +1,6 @@
+training_output/
+datasets/
+lerobot_dataset/
+__pycache__/
+*.pyc
+.vscode/
