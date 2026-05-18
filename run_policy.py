@@ -1,158 +1,151 @@
-"""
-학습된 ACT 모델로 자율 동작 실행
-
-  q : 종료 (Policy 창에서)
-"""
-
 import sys
 import time
+import threading
 import numpy as np
 import cv2
 import serial
 import torch
 
 sys.path.insert(0, "C:/Users/parks/lerobot/src")
-
 from lerobot.policies.act.modeling_act import ACTPolicy
+from lerobot.policies.factory import make_pre_post_processors
+from lerobot.processor.converters import PolicyAction
 
-# ── 설정 ──────────────────────────────────────────────────────────────
 MODEL_PATH = "C:/Users/parks/esp32_robot_arm/training_output/checkpoints/last/pretrained_model"
-COM_PORT   = "COM6"
+COM_PORT   = "COM3"
 BAUD_RATE  = 115200
 FPS        = 30
 FRAME_MS   = int(1000 / FPS)
-DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ── 정규화 통계 (학습 시 사용된 값) ───────────────────────────────────
-STATE_MEAN = np.array([80.4144, 81.3236, 132.7538,  0.0,  96.4020, 70.3869], dtype=np.float32)
-STATE_STD  = np.array([13.7177, 25.4828,  25.6123,  1.0,  20.1296, 27.9390], dtype=np.float32)  # s4 std=0 → 1로 대체
-ACT_MEAN   = np.array([80.4144, 81.3236, 132.7538,  0.0,  96.4020, 70.3869], dtype=np.float32)
-ACT_STD    = np.array([13.7177, 25.4828,  25.6123,  1.0,  20.1296, 27.9390], dtype=np.float32)
-
-# ── 각도 제한 (ESP32 펌웨어와 동일) ──────────────────────────────────
-ANGLE_MIN = np.array([  0,   0,   0,  0,   0,  40], dtype=np.float32)
-ANGLE_MAX = np.array([180, 180, 180,  0, 180, 110], dtype=np.float32)
-
-# ── 카메라 탐지 ───────────────────────────────────────────────────────
-def find_webcam():
-    for i in range(6):
-        cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
-        if cap.isOpened():
-            ret, frame = cap.read()
-            if ret and frame is not None and frame.std() > 10:
-                print(f"[INFO] 웹캠 발견: index {i}")
-                return cap
-            cap.release()
-    return None
+ANGLE_MIN = np.array([0,   0,   0,   0,   0,  20], dtype=np.float32)
+ANGLE_MAX = np.array([180, 180, 180, 180, 180, 110], dtype=np.float32)
+MAX_DELTA = 1.0  # 프레임당 최대 이동 각도 (도). 줄이면 더 느려짐
 
 
-# ── 시리얼 각도 전송 ──────────────────────────────────────────────────
-class AngleWriter:
+def init_cameras():
+    cam_wrist = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    cam_full  = cv2.VideoCapture(1, cv2.CAP_DSHOW)
+
+    if not cam_wrist.isOpened() or not cam_full.isOpened():
+        print("[ERROR] 카메라 2개 필요")
+        return None, None
+
+    print("[INFO] WristCam=0 / FullCam=1")
+    return cam_wrist, cam_full
+
+
+class SerialHandler:
+    """시리얼 읽기(실제 각도) + 쓰기(명령) 통합 처리"""
     def __init__(self, port, baud):
         self._ser = serial.Serial(port, baud, timeout=1)
+        self._angles = np.array([77, 136, 180, 0, 90, 69], dtype=np.float32)
+        self._lock = threading.Lock()
+        self._running = True
+        threading.Thread(target=self._read_loop, daemon=True).start()
         time.sleep(0.5)
+
+    def _read_loop(self):
+        while self._running:
+            try:
+                line = self._ser.readline().decode("utf-8", errors="ignore").strip()
+                if line.startswith("s1:"):
+                    vals = [float(p.split(":")[1]) for p in line.split(",")]
+                    if len(vals) == 6:
+                        with self._lock:
+                            self._angles = np.array(vals, dtype=np.float32)
+            except Exception:
+                pass
+
+    def get_angles(self):
+        with self._lock:
+            return self._angles.copy()
 
     def send(self, angles):
         cmd = "a:" + ",".join(str(int(round(float(a)))) for a in angles) + "\n"
         self._ser.write(cmd.encode())
 
     def close(self):
+        self._running = False
         self._ser.close()
 
 
-# ── 메인 ─────────────────────────────────────────────────────────────
 def main():
-    print(f"[INFO] 모델 로드 중... ({DEVICE})")
+    print(f"[INFO] 모델 로드 중...")
     policy = ACTPolicy.from_pretrained(MODEL_PATH)
-    policy.to(DEVICE)
     policy.eval()
     policy.reset()
-    print("[INFO] 모델 로드 완료")
 
-    print(f"[INFO] 시리얼 연결 중... {COM_PORT}")
-    try:
-        writer = AngleWriter(COM_PORT, BAUD_RATE)
-    except Exception as e:
-        print(f"[ERROR] 시리얼 연결 실패: {e}")
-        sys.exit(1)
-    print("[INFO] 시리얼 OK")
+    preprocessor, postprocessor = make_pre_post_processors(
+        policy_cfg=policy.config,
+        pretrained_path=MODEL_PATH,
+    )
 
-    cap = find_webcam()
-    if cap is None:
-        print("[ERROR] 웹캠을 찾을 수 없습니다.")
-        writer.close()
+    print("[INFO] 시리얼 연결")
+    handler = SerialHandler(COM_PORT, BAUD_RATE)
+
+    cap_wrist, cap_full = init_cameras()
+    if cap_wrist is None:
+        handler.close()
         sys.exit(1)
 
-    print()
-    print("[INFO] 5초 후 자율 동작 시작... (Policy 창에서 q=종료)")
-    print()
+    # ESP32 리셋 후 서보가 이동하는 ANGLE_INIT 위치
+    angles = np.array([72, 108, 180, 31, 158, 69], dtype=np.float32)
 
-    running    = False
+    running = False
     start_time = time.time()
-    angles     = np.array([77, 136, 180, 0, 90, 69], dtype=np.float32)  # ESP32 초기값
 
-    try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                time.sleep(0.01)
-                continue
+    print("[INFO] 5초 후 시작 | q: 종료")
 
-            elapsed = time.time() - start_time
+    while True:
+        ret1, frame1 = cap_wrist.read()
+        ret2, frame2 = cap_full.read()
 
-            # 5초 후 자동 시작
-            if not running and elapsed >= 5.0:
-                running = True
-                policy.reset()
-                print("[INFO] 자율 동작 시작")
+        if not ret1 or not ret2:
+            continue
 
-            if running:
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                img_tensor = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
-                img_tensor = img_tensor.unsqueeze(0).to(DEVICE)
+        elapsed = time.time() - start_time
 
-                # 상태 정규화
-                state_norm = (angles - STATE_MEAN) / STATE_STD
-                state_tensor = torch.from_numpy(state_norm).unsqueeze(0).to(DEVICE)
+        if not running and elapsed >= 5:
+            running = True
+            policy.reset()
+            print(f"[INFO] 시작")
 
-                with torch.no_grad():
-                    batch = {
-                        "observation.images.wrist": img_tensor,
-                        "observation.state": state_tensor,
-                    }
-                    action_norm = policy.select_action(batch).squeeze(0).cpu().numpy()
+        if running:
+            # 실제 서보 각도를 state로 사용
+            angles = handler.get_angles()
 
-                # 액션 역정규화 → 실제 각도
-                angles = action_norm * ACT_STD + ACT_MEAN
-                angles = np.clip(angles, ANGLE_MIN, ANGLE_MAX)
-                writer.send(angles)
+            rgb1 = cv2.cvtColor(frame1, cv2.COLOR_BGR2RGB)
+            rgb2 = cv2.cvtColor(frame2, cv2.COLOR_BGR2RGB)
 
-            # 미리보기
-            if running:
-                color  = (0, 0, 255)
-                status = "RUNNING"
-            else:
-                color  = (0, 200, 0)
-                remain = max(0, 5.0 - elapsed)
-                status = f"START IN {remain:.1f}s"
+            img1 = torch.from_numpy(rgb1).permute(2, 0, 1).float() / 255.0
+            img2 = torch.from_numpy(rgb2).permute(2, 0, 1).float() / 255.0
 
-            disp = frame.copy()
-            cv2.putText(disp, status, (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-            angle_str = " ".join(f"s{i+1}:{int(a)}" for i, a in enumerate(angles))
-            cv2.putText(disp, angle_str, (10, frame.shape[0] - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            cv2.imshow("Policy", disp)
+            obs = {
+                "observation.images.wrist": img1,
+                "observation.images.full":  img2,
+                "observation.state": torch.from_numpy(angles),
+            }
 
-            key = cv2.waitKey(FRAME_MS) & 0xFF
-            if key == ord("q"):
-                break
+            with torch.no_grad():
+                obs_pre = preprocessor(obs)
+                action_raw = policy.select_action(obs_pre)
+                action_out = postprocessor(PolicyAction(action_raw))
 
-    finally:
-        cap.release()
-        cv2.destroyAllWindows()
-        writer.close()
-        print("[DONE] 종료")
+            target = action_out.squeeze(0).cpu().numpy()
+            target = np.clip(target, ANGLE_MIN, ANGLE_MAX)
+            cmd = np.clip(target, angles - MAX_DELTA, angles + MAX_DELTA)
+            handler.send(cmd)
+
+        cv2.imshow("Wrist", frame1)
+        cv2.imshow("Full",  frame2)
+
+        if cv2.waitKey(FRAME_MS) & 0xFF == ord("q"):
+            break
+
+    cap_wrist.release()
+    cap_full.release()
+    cv2.destroyAllWindows()
+    handler.close()
 
 
 if __name__ == "__main__":

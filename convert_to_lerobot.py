@@ -1,19 +1,10 @@
-"""
-수집된 데이터셋을 LeRobot 포맷으로 변환
-
-사용법:
-  python convert_to_lerobot.py
-"""
-
 import json
 import sys
 import numpy as np
 import cv2
 from pathlib import Path
 
-# LeRobot 소스 경로 추가
 sys.path.insert(0, "C:/Users/parks/lerobot/src")
-
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 # ── 설정 ──────────────────────────────────────────────────────────────
@@ -24,8 +15,14 @@ TASK       = "pick and place"
 NUM_JOINTS = 6
 FPS        = 30
 
+# 🔥 카메라 2개로 확장
 FEATURES = {
     "observation.images.wrist": {
+        "dtype": "video",
+        "shape": (480, 640, 3),
+        "names": ["height", "width", "channels"],
+    },
+    "observation.images.full": {   # ✅ 추가됨
         "dtype": "video",
         "shape": (480, 640, 3),
         "names": ["height", "width", "channels"],
@@ -51,11 +48,9 @@ def main():
 
     print(f"[INFO] 에피소드 {len(episodes)}개 발견")
 
-    # 기존 폴더 있으면 삭제
     if DST_ROOT.exists():
         import shutil
         shutil.rmtree(DST_ROOT)
-        print(f"[INFO] 기존 폴더 삭제: {DST_ROOT}")
 
     dataset = LeRobotDataset.create(
         repo_id=REPO_ID,
@@ -69,9 +64,10 @@ def main():
 
     for ep_num, ep_dir in enumerate(episodes):
         angles_path = ep_dir / "angles.json"
-        video_path  = ep_dir / "cam_wrist.mp4"
+        wrist_video = ep_dir / "cam_wrist.mp4"
+        full_video  = ep_dir / "cam_full.mp4"   # ✅ 추가
 
-        if not angles_path.exists() or not video_path.exists():
+        if not (angles_path.exists() and wrist_video.exists() and full_video.exists()):
             print(f"[SKIP] {ep_dir.name} — 파일 없음")
             continue
 
@@ -80,34 +76,45 @@ def main():
 
         frames_angles = data["frames"]
 
-        cap = cv2.VideoCapture(str(video_path))
-        total_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        n_frames = min(len(frames_angles), total_video_frames)
+        cap_wrist = cv2.VideoCapture(str(wrist_video))
+        cap_full  = cv2.VideoCapture(str(full_video))  # ✅ 추가
 
-        print(f"[CONV] {ep_dir.name}  {n_frames}프레임 ({n_frames/FPS:.1f}초)")
+        total_frames = min(
+            len(frames_angles),
+            int(cap_wrist.get(cv2.CAP_PROP_FRAME_COUNT)),
+            int(cap_full.get(cv2.CAP_PROP_FRAME_COUNT))
+        )
 
-        for i in range(n_frames):
-            ret, bgr = cap.read()
-            if not ret:
+        print(f"[CONV] {ep_dir.name}  {total_frames}프레임")
+
+        for i in range(total_frames):
+            ret1, bgr1 = cap_wrist.read()
+            ret2, bgr2 = cap_full.read()
+
+            if not ret1 or not ret2:
                 break
 
-            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            rgb1 = cv2.cvtColor(bgr1, cv2.COLOR_BGR2RGB)
+            rgb2 = cv2.cvtColor(bgr2, cv2.COLOR_BGR2RGB)
+
             angles = np.array(frames_angles[i], dtype=np.float32)
 
             dataset.add_frame({
                 "task": TASK,
-                "observation.images.wrist": rgb,
+                "observation.images.wrist": rgb1,
+                "observation.images.full": rgb2,   # ✅ 추가
                 "observation.state": angles,
                 "action": angles,
             })
 
-        cap.release()
+        cap_wrist.release()
+        cap_full.release()
+
         dataset.save_episode()
-        print(f"       저장 완료")
+        print("       저장 완료")
 
     dataset.finalize()
     print(f"\n[DONE] 변환 완료 → {DST_ROOT}")
-    print(f"       총 에피소드: {len(episodes)}개")
 
 
 if __name__ == "__main__":

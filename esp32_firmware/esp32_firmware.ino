@@ -1,23 +1,27 @@
 #include <ESP32Servo.h>
 
-// ─── 서보 핀 ──────────────────────────────────────────────────────────
+// ─── 가변저항 ADC 핀 (S1~S5) ─────────────────────────────────────────
+const int POT_PINS[5] = {34, 35, 36, 39, 32};
+
+// ─── 조이스틱 핀 (S6 그리퍼) ─────────────────────────────────────────
+#define JOY_PIN   33
+#define JOY_HIGH  3200
+#define JOY_LOW   1400
+
+// ─── 서보 핀 (자율동작 모드) ──────────────────────────────────────────
 const int SERVO_PINS[6] = {13, 12, 14, 27, 25, 26};
 
-// ─── 조이스틱 ADC 핀 ─────────────────────────────────────────────────
-const int JOY_PINS[6] = {34, 35, 36, 39, 32, 33};
-
 // ─── 동작 설정 ────────────────────────────────────────────────────────
-const int ANGLE_INIT[6] = { 77, 136, 180,   0,  90,  69};
-const int ANGLE_MIN[6]  = {  0,   0,   0,   0,   0,  40};
+const int ANGLE_INIT[6] = { 72, 108, 180,   31,  158,  69};
+const int ANGLE_MIN[6]  = {  0,   0,   0,   0,   0,  20};
 const int ANGLE_MAX[6]  = {180, 180, 180, 180, 180, 110};
-const int ANGLE_STEP    = 1;
 
-const int ADC_HIGH = 2700;
-const int ADC_LOW  = 1400;
+const int ADC_LOW  = 200;
+const int ADC_HIGH = 4075;
 
-const unsigned long SERIAL_MS  = 100;   // 각도 전송 주기 (10Hz)
-const int           LOOP_MS    = 10;    // 루프 주기 (~100Hz)
-const unsigned long AUTO_TIMEOUT = 500; // 이 ms 동안 PC 명령 없으면 조이스틱으로 복귀
+const unsigned long SERIAL_MS   = 100;
+const int           LOOP_MS     = 10;
+const unsigned long AUTO_TIMEOUT = 500;
 
 // ─── 전역 변수 ────────────────────────────────────────────────────────
 Servo         servos[6];
@@ -31,8 +35,7 @@ String        cmdBuf         = "";
 bool parseCommand(const String& line, int out[6]) {
     if (!line.startsWith("a:")) return false;
     String body = line.substring(2);
-    int idx = 0;
-    int start = 0;
+    int idx = 0, start = 0;
     for (int i = 0; i <= body.length() && idx < 6; i++) {
         if (i == body.length() || body[i] == ',') {
             out[idx++] = body.substring(start, i).toInt();
@@ -45,7 +48,10 @@ bool parseCommand(const String& line, int out[6]) {
 // ─── Setup ────────────────────────────────────────────────────────────
 void setup() {
     Serial.begin(115200);
-    delay(200);
+    delay(300);
+
+    for (int i = 0; i < 5; i++) pinMode(POT_PINS[i], INPUT);
+    pinMode(JOY_PIN, INPUT);
 
     ESP32PWM::allocateTimer(0);
     ESP32PWM::allocateTimer(1);
@@ -58,25 +64,33 @@ void setup() {
         servos[i].attach(SERVO_PINS[i], 500, 2500);
         servos[i].write(angles[i]);
     }
+    delay(1500);
+    for (int i = 0; i < 5; i++) servos[i].detach();  // S1~S5만 detach (손으로 이동)
 
     Serial.println("[INIT] ready");
 }
 
 // ─── Loop ─────────────────────────────────────────────────────────────
 void loop() {
-    // 시리얼 수신 처리
+    // ── PC 시리얼 명령 수신 (자율동작) ───────────────────────────────
     while (Serial.available()) {
         char c = Serial.read();
         if (c == '\n') {
             cmdBuf.trim();
             int parsed[6];
             if (parseCommand(cmdBuf, parsed)) {
+                if (!autoMode) {
+                    for (int i = 0; i < 5; i++) {
+                        servos[i].setPeriodHertz(50);
+                        servos[i].attach(SERVO_PINS[i], 500, 2500);
+                    }
+                    autoMode = true;
+                }
                 for (int i = 0; i < 6; i++) {
                     angles[i] = constrain(parsed[i], ANGLE_MIN[i], ANGLE_MAX[i]);
                     servos[i].write(angles[i]);
                 }
                 lastCmdTime = millis();
-                autoMode = true;
             }
             cmdBuf = "";
         } else {
@@ -84,25 +98,32 @@ void loop() {
         }
     }
 
-    // AUTO_TIMEOUT 동안 명령 없으면 조이스틱 모드로 복귀
     if (autoMode && (millis() - lastCmdTime > AUTO_TIMEOUT)) {
         autoMode = false;
     }
 
-    // 조이스틱 모드
-    if (!autoMode) {
-        for (int i = 0; i < 6; i++) {
-            int val = analogRead(JOY_PINS[i]);
-            if (val > ADC_HIGH) {
-                angles[i] = constrain(angles[i] + ANGLE_STEP, ANGLE_MIN[i], ANGLE_MAX[i]);
-            } else if (val < ADC_LOW) {
-                angles[i] = constrain(angles[i] - ANGLE_STEP, ANGLE_MIN[i], ANGLE_MAX[i]);
-            }
-            servos[i].write(angles[i]);
+    // ── 가변저항 S1~S5 + 조이스틱 S6 (수집 모드) ─────────────────────
+if (!autoMode) {
+    for (int i = 0; i < 5; i++) {
+        int raw = analogRead(POT_PINS[i]);
+        int deg;
+
+        if (i == 3) {
+            deg = map(raw, 170, 3750, 0, 180);
+        } else {
+            deg = map(raw, ADC_LOW, ADC_HIGH, 0, 180);
         }
+
+        angles[i] = constrain(deg, ANGLE_MIN[i], ANGLE_MAX[i]);
     }
 
-    // 100ms마다 PC로 현재 각도 전송
+    int joy = analogRead(JOY_PIN);
+    if      (joy > JOY_HIGH) angles[5] = constrain(angles[5] + 1, ANGLE_MIN[5], ANGLE_MAX[5]);
+    else if (joy < JOY_LOW)  angles[5] = constrain(angles[5] - 1, ANGLE_MIN[5], ANGLE_MAX[5]);
+    servos[5].write(angles[5]);
+}
+
+    // ── 10Hz 각도 전송 ────────────────────────────────────────────────
     unsigned long now = millis();
     if (now - lastSerialTime >= SERIAL_MS) {
         lastSerialTime = now;

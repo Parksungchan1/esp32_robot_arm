@@ -1,6 +1,8 @@
 training_output/
 datasets/
 lerobot_dataset/
+can/
 __pycache__/
 *.pyc
 .vscode/
+venv/

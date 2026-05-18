@@ -1,10 +1,3 @@
-"""
-데이터 수집 스크립트
-  Space : 에피소드 시작 / 종료
-  d     : 마지막 에피소드 삭제 (잘못 찍었을 때)
-  q     : 전체 종료
-"""
-
 import cv2
 import serial
 import threading
@@ -14,27 +7,25 @@ import sys
 import shutil
 from pathlib import Path
 
-# ── 설정 ──────────────────────────────────────────────────────────────
-COM_PORT     = "COM6"
+COM_PORT     = "COM3"
 BAUD_RATE    = 115200
 FPS          = 30
 FRAME_MS     = int(1000 / FPS)
 DATASET_DIR  = Path("C:/Users/parks/esp32_robot_arm/datasets")
 
-# ── 카메라 자동 탐지 ──────────────────────────────────────────────────
-def find_webcam():
-    """연결된 USB 웹캠 탐지 — 열린 VideoCapture 객체 반환"""
-    for i in range(6):
-        cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
-        if cap.isOpened():
-            ret, frame = cap.read()
-            if ret and frame is not None and frame.std() > 10:
-                print(f"[INFO] 웹캠 발견: index {i}")
-                return cap
-            cap.release()
-    return None
 
-# ── 시리얼 각도 리더 (백그라운드 스레드) ──────────────────────────────
+def init_cameras():
+    cam_wrist = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    cam_full  = cv2.VideoCapture(1, cv2.CAP_DSHOW)
+
+    if not cam_wrist.isOpened() or not cam_full.isOpened():
+        print("[ERROR] 카메라 2개 모두 연결되어야 함")
+        return None, None
+
+    print("[INFO] WristCam = 0 / FullCam = 1")
+    return cam_wrist, cam_full
+
+
 class AngleReader:
     def __init__(self, port, baud):
         self.angles = [90, 90, 90, 90, 90, 80]
@@ -64,128 +55,107 @@ class AngleReader:
         self._ser.close()
 
 
-# ── 에피소드 저장 ─────────────────────────────────────────────────────
-def finish_episode(ep_dir, vw, angle_log, frame_count):
-    vw.release()
+def finish_episode(ep_dir, vw1, vw2, angle_log, frame_count):
+    vw1.release()
+    vw2.release()
+
     with open(ep_dir / "angles.json", "w") as f:
         json.dump({"fps": FPS, "frames": angle_log}, f)
-    print(f"[SAVE] {ep_dir.name}  —  {frame_count}프레임 ({frame_count/FPS:.1f}초)")
+
+    print(f"[SAVE] {ep_dir.name}  —  {frame_count}프레임")
 
 
-def delete_last(ep_idx, last_ep_dir):
-    if last_ep_dir and last_ep_dir.exists():
-        shutil.rmtree(last_ep_dir)
-        print(f"[DEL]  {last_ep_dir.name} 삭제됨")
-        return ep_idx - 1
-    print("[WARN] 삭제할 에피소드 없음")
-    return ep_idx
-
-
-# ── 메인 ─────────────────────────────────────────────────────────────
 def main():
     DATASET_DIR.mkdir(parents=True, exist_ok=True)
 
-    ep_idx     = len(sorted(DATASET_DIR.glob("episode_*")))
-    last_saved = None
+    ep_idx = len(sorted(DATASET_DIR.glob("episode_*")))
 
-    # 시리얼
     print(f"[INFO] 시리얼 연결 중... {COM_PORT}")
-    try:
-        reader = AngleReader(COM_PORT, BAUD_RATE)
-    except Exception as e:
-        print(f"[ERROR] 시리얼 연결 실패: {e}")
-        sys.exit(1)
+    reader = AngleReader(COM_PORT, BAUD_RATE)
     time.sleep(0.5)
-    print(f"[INFO] 시리얼 OK  초기 각도: {reader.get()}")
 
-    # 카메라 자동 탐지
-    cap = find_webcam()
-    if cap is None:
-        print("[ERROR] USB 웹캠을 찾을 수 없습니다.")
+    
+    cap_wrist, cap_full = init_cameras()
+    if cap_wrist is None:
         reader.close()
         sys.exit(1)
 
-    cap.set(cv2.CAP_PROP_FPS, FPS)
+    cap_wrist.set(cv2.CAP_PROP_FPS, FPS)
+    cap_full.set(cv2.CAP_PROP_FPS, FPS)
 
-    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"[INFO] 카메라 {W}x{H} @ {FPS}fps")
-    print(f"[INFO] 저장 경로: {DATASET_DIR}")
-    print()
-    print("  Space : 에피소드 시작 / 종료")
-    print("  d     : 마지막 에피소드 삭제")
-    print("  q     : 전체 종료")
-    print()
+    W = int(cap_wrist.get(cv2.CAP_PROP_FRAME_WIDTH))
+    H = int(cap_wrist.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    recording   = False
-    vw          = None
-    angle_log   = []
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+
+    recording = False
+    vw1 = None
+    vw2 = None
+    angle_log = []
     frame_count = 0
-    ep_dir      = None
-    fourcc      = cv2.VideoWriter_fourcc(*"mp4v")
 
-    try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                time.sleep(0.01)
-                continue
+    print("[INFO] Space: 시작/종료 | q: 종료")
 
-            angles = reader.get()
+    while True:
+        ret1, frame1 = cap_wrist.read()
+        ret2, frame2 = cap_full.read()
 
-            if recording:
-                vw.write(frame)
-                angle_log.append(angles)
-                frame_count += 1
+        if not ret1 or not ret2:
+            print("[ERROR] 카메라 프레임 실패")
+            break
 
-            # 미리보기 오버레이
-            color  = (0, 0, 255) if recording else (0, 200, 0)
-            status = f"REC  ep{ep_idx:03d}  {frame_count/FPS:.1f}s" if recording else f"STANDBY  ep{ep_idx:03d}"
-            disp = frame.copy()
-            cv2.putText(disp, status, (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
-            angle_str = " ".join(f"s{i+1}:{v}" for i, v in enumerate(angles))
-            cv2.putText(disp, angle_str, (10, H - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            cv2.imshow("Wrist", disp)
+        angles = reader.get()
 
-            key = cv2.waitKey(FRAME_MS) & 0xFF
-
-            if key == ord("q"):
-                if recording:
-                    finish_episode(ep_dir, vw, angle_log, frame_count)
-                    ep_idx += 1
-                break
-
-            elif key == ord(" "):
-                if not recording:
-                    ep_dir      = DATASET_DIR / f"episode_{ep_idx:03d}"
-                    ep_dir.mkdir(parents=True, exist_ok=True)
-                    vw          = cv2.VideoWriter(str(ep_dir / "cam_wrist.mp4"), fourcc, FPS, (W, H))
-                    angle_log   = []
-                    frame_count = 0
-                    recording   = True
-                    print(f"[REC]  에피소드 {ep_idx:03d} 시작")
-                else:
-                    recording  = False
-                    last_saved = ep_dir
-                    finish_episode(ep_dir, vw, angle_log, frame_count)
-                    ep_idx += 1
-
-            elif key == ord("d") and not recording:
-                ep_idx     = delete_last(ep_idx, last_saved)
-                last_saved = None
-
-    except KeyboardInterrupt:
-        print("\n[INFO] 중단됨")
         if recording:
-            finish_episode(ep_dir, vw, angle_log, frame_count)
+            vw1.write(frame1)
+            vw2.write(frame2)
+            angle_log.append(angles)
+            frame_count += 1
 
-    finally:
-        cap.release()
-        cv2.destroyAllWindows()
-        reader.close()
-        print(f"\n[DONE] 총 저장 에피소드: {len(sorted(DATASET_DIR.glob('episode_*')))}개")
+        # 미리보기 오버레이
+        color  = (0, 0, 255) if recording else (0, 200, 0)
+        status = f"REC  ep{ep_idx:03d}  {frame_count/FPS:.1f}s" if recording else f"STANDBY  ep{ep_idx:03d}"
+        angle_str = " ".join(f"s{i+1}:{v}" for i, v in enumerate(angles))
+
+        disp1 = frame1.copy()
+        cv2.putText(disp1, status,    (10, 30),   cv2.FONT_HERSHEY_SIMPLEX, 0.65, color,           2)
+        cv2.putText(disp1, angle_str, (10, H-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5,  (255, 255, 255), 1)
+        cv2.putText(disp1, "Space:시작/종료  q:종료", (10, H-30), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1)
+
+        disp2 = frame2.copy()
+        cv2.putText(disp2, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
+
+        cv2.imshow("WristCam", disp1)
+        cv2.imshow("FullCam",  disp2)
+
+        key = cv2.waitKey(FRAME_MS) & 0xFF
+
+        if key == ord("q"):
+            break
+
+        elif key == ord(" "):
+            if not recording:
+                ep_dir = DATASET_DIR / f"episode_{ep_idx:03d}"
+                ep_dir.mkdir(parents=True, exist_ok=True)
+
+                vw1 = cv2.VideoWriter(str(ep_dir / "cam_wrist.mp4"), fourcc, FPS, (W, H))
+                vw2 = cv2.VideoWriter(str(ep_dir / "cam_full.mp4"),  fourcc, FPS, (W, H))
+
+                angle_log = []
+                frame_count = 0
+                recording = True
+
+                print(f"[REC] episode {ep_idx:03d} 시작")
+
+            else:
+                recording = False
+                finish_episode(ep_dir, vw1, vw2, angle_log, frame_count)
+                ep_idx += 1
+
+    cap_wrist.release()
+    cap_full.release()
+    cv2.destroyAllWindows()
+    reader.close()
 
 
 if __name__ == "__main__":
