@@ -12,7 +12,7 @@ const int POT_PINS[5] = {34, 35, 36, 39, 32};
 const int SERVO_PINS[6] = {13, 12, 14, 27, 25, 26};
 
 // ─── 동작 설정 ────────────────────────────────────────────────────────
-const int ANGLE_INIT[6] = { 72, 108, 180,   31,  158,  69};
+const int ANGLE_INIT[6] = { 85, 94, 130,   4,  80,  72};
 const int ANGLE_MIN[6]  = {  0,   0,   0,   0,   0,  20};
 const int ANGLE_MAX[6]  = {180, 180, 180, 180, 180, 110};
 
@@ -106,14 +106,7 @@ void loop() {
 if (!autoMode) {
     for (int i = 0; i < 5; i++) {
         int raw = analogRead(POT_PINS[i]);
-        int deg;
-
-        if (i == 3) {
-            deg = map(raw, 170, 3750, 0, 180);
-        } else {
-            deg = map(raw, ADC_LOW, ADC_HIGH, 0, 180);
-        }
-
+        int deg = map(raw, ADC_LOW, ADC_HIGH, 0, 180);
         angles[i] = constrain(deg, ANGLE_MIN[i], ANGLE_MAX[i]);
     }
 

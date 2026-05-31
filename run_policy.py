@@ -19,7 +19,7 @@ FRAME_MS   = int(1000 / FPS)
 
 ANGLE_MIN = np.array([0,   0,   0,   0,   0,  20], dtype=np.float32)
 ANGLE_MAX = np.array([180, 180, 180, 180, 180, 110], dtype=np.float32)
-MAX_DELTA = 1.0  # 프레임당 최대 이동 각도 (도). 줄이면 더 느려짐
+MAX_DELTA = 0.5  # 프레임당 최대 이동 각도 (도). 줄이면 더 느려짐
 
 
 def init_cameras():
