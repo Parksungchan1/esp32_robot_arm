@@ -9,10 +9,10 @@ const int POT_PINS[5] = {34, 35, 36, 39, 32};
 #define JOY_LOW   1400
 
 // ─── 서보 핀 (자율동작 모드) ──────────────────────────────────────────
-const int SERVO_PINS[6] = {13, 12, 14, 27, 25, 26};
+const int SERVO_PINS[6] = {13, 16, 14, 27, 25, 26};
 
 // ─── 동작 설정 ────────────────────────────────────────────────────────
-const int ANGLE_INIT[6] = { 85, 94, 130,   4,  80,  72};
+const int ANGLE_INIT[6] = { 104, 106, 128,   24,  90,  72};
 const int ANGLE_MIN[6]  = {  0,   0,   0,   0,   0,  20};
 const int ANGLE_MAX[6]  = {180, 180, 180, 180, 180, 110};
 
@@ -21,7 +21,7 @@ const int ADC_HIGH = 4075;
 
 const unsigned long SERIAL_MS   = 100;
 const int           LOOP_MS     = 10;
-const unsigned long AUTO_TIMEOUT = 500;
+const unsigned long AUTO_TIMEOUT = 2000;
 
 // ─── 전역 변수 ────────────────────────────────────────────────────────
 Servo         servos[6];
@@ -104,16 +104,21 @@ void loop() {
 
     // ── 가변저항 S1~S5 + 조이스틱 S6 (수집 모드) ─────────────────────
 if (!autoMode) {
-    for (int i = 0; i < 5; i++) {
-        int raw = analogRead(POT_PINS[i]);
-        int deg = map(raw, ADC_LOW, ADC_HIGH, 0, 180);
-        angles[i] = constrain(deg, ANGLE_MIN[i], ANGLE_MAX[i]);
-    }
-
+    // S6 먼저 업데이트
+    int s6_prev = angles[5];
     int joy = analogRead(JOY_PIN);
     if      (joy > JOY_HIGH) angles[5] = constrain(angles[5] + 1, ANGLE_MIN[5], ANGLE_MAX[5]);
     else if (joy < JOY_LOW)  angles[5] = constrain(angles[5] - 1, ANGLE_MIN[5], ANGLE_MAX[5]);
     servos[5].write(angles[5]);
+
+    // S6가 움직이지 않을 때만 S1~S5 ADC 읽기 (S6 전류 노이즈 차단)
+    if (angles[5] == s6_prev) {
+        for (int i = 0; i < 5; i++) {
+            int raw = analogRead(POT_PINS[i]);
+            int deg = map(raw, ADC_LOW, ADC_HIGH, 0, 180);
+            angles[i] = constrain(deg, ANGLE_MIN[i], ANGLE_MAX[i]);
+        }
+    }
 }
 
     // ── 10Hz 각도 전송 ────────────────────────────────────────────────

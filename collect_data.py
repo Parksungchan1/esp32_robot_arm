@@ -11,7 +11,7 @@ COM_PORT     = "COM3"
 BAUD_RATE    = 115200
 FPS          = 30
 FRAME_MS     = int(1000 / FPS)
-DATASET_DIR  = Path("C:/Users/parks/esp32_robot_arm/datasets")
+DATASET_DIR  = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("C:/Users/parks/esp32_robot_arm/datasets")
 
 
 def init_cameras():
@@ -74,7 +74,7 @@ def main():
     reader = AngleReader(COM_PORT, BAUD_RATE)
     time.sleep(0.5)
 
-    
+
     cap_wrist, cap_full = init_cameras()
     if cap_wrist is None:
         reader.close()
@@ -93,8 +93,9 @@ def main():
     vw2 = None
     angle_log = []
     frame_count = 0
+    phase = 1  # 1:잡기/들기  2:입쪽이동  3:복귀  4:내려놓기
 
-    print("[INFO] Space: 시작/종료 | q: 종료")
+    print("[INFO] Space: 시작/종료 | 1/2/3/4: phase 전환 | q: 종료")
 
     while True:
         ret1, frame1 = cap_wrist.read()
@@ -109,18 +110,19 @@ def main():
         if recording:
             vw1.write(frame1)
             vw2.write(frame2)
-            angle_log.append(angles)
+            angle_log.append(angles + [phase])
             frame_count += 1
 
         # 미리보기 오버레이
         color  = (0, 0, 255) if recording else (0, 200, 0)
-        status = f"REC  ep{ep_idx:03d}  {frame_count/FPS:.1f}s" if recording else f"STANDBY  ep{ep_idx:03d}"
+        phase_labels = {1:"잡기/들기", 2:"입쪽이동", 3:"복귀", 4:"내려놓기"}
+        status = f"REC  ep{ep_idx:03d}  {frame_count/FPS:.1f}s  [P{phase}:{phase_labels[phase]}]" if recording else f"STANDBY  ep{ep_idx:03d}"
         angle_str = " ".join(f"s{i+1}:{v}" for i, v in enumerate(angles))
 
         disp1 = frame1.copy()
         cv2.putText(disp1, status,    (10, 30),   cv2.FONT_HERSHEY_SIMPLEX, 0.65, color,           2)
         cv2.putText(disp1, angle_str, (10, H-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5,  (255, 255, 255), 1)
-        cv2.putText(disp1, "Space:시작/종료  q:종료", (10, H-30), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1)
+        cv2.putText(disp1, "Space:시작/종료  1/2/3/4:phase  q:종료", (10, H-30), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1)
 
         disp2 = frame2.copy()
         cv2.putText(disp2, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
@@ -133,6 +135,10 @@ def main():
         if key == ord("q"):
             break
 
+        elif key in (ord("1"), ord("2"), ord("3"), ord("4")):
+            phase = int(chr(key))
+            print(f"[PHASE] {phase} — {phase_labels[phase]}")
+
         elif key == ord(" "):
             if not recording:
                 ep_dir = DATASET_DIR / f"episode_{ep_idx:03d}"
@@ -143,9 +149,10 @@ def main():
 
                 angle_log = []
                 frame_count = 0
+                phase = 1
                 recording = True
 
-                print(f"[REC] episode {ep_idx:03d} 시작")
+                print(f"[REC] episode {ep_idx:03d} 시작 (Phase 1부터)")
 
             else:
                 recording = False
